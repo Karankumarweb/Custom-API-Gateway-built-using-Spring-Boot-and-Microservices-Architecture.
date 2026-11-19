@@ -1,5 +1,7 @@
 # GateKeeper – Custom API Gateway
 
+[Architecture](#system-architecture) · [Local setup](#installation-and-setup) · [API reference](#api-documentation) · [Testing](#testing)
+
 ## Project overview
 
 GateKeeper separates **who may configure an API** from **how a gateway discovers that configuration**. A platform operator can onboard organizations, a tenant administrator can maintain that organization's routes, and a gateway process can retrieve the active configuration without redeployment. This addresses a common problem in shared API platforms: changing one tenant's integration should not require editing every gateway's configuration by hand.
@@ -46,25 +48,60 @@ flowchart LR
 
 ## Project structure
 
+Selected packages and resources, grouped by service:
+
 ```text
-compose.yaml                          Local infrastructure only
-smart-gateway-service/
-  src/main/java/in/coderarmy/gatekeeper/gateway/
-    client/  config/  controller/  dto/  event/  service/
-api-management-service/
-  Jenkinsfile                         Management build/test/package/deploy pipeline
-  src/main/java/in/coderarmy/gatekeeper/management/
-    config/  controller/  dto/  entity/  event/  exception/  repository/  service/
-  src/main/resources/
-    db/migration/                     Versioned DDL and seed SQL
-    static/                           index.html, styles.css, app.js
-  src/test/resources/application.properties
-analytics-service/
-  src/main/java/in/coderarmy/gatekeeper/analytics/
-    config/  controller/  dto/responseDto/
+.
+├── compose.yaml                                  # Local Redis and Kafka
+├── smart-gateway-service/
+│   └── src/main/java/in/coderarmy/gatekeeper/gateway/
+│       ├── client/                               # Management API client
+│       ├── config/
+│       ├── controller/
+│       ├── dto/
+│       ├── event/                                # Configuration notifications
+│       └── service/                              # Route refresh
+├── api-management-service/
+│   ├── Jenkinsfile                               # Management CI/CD pipeline
+│   └── src/
+│       ├── main/
+│       │   ├── java/in/coderarmy/gatekeeper/management/
+│       │   │   ├── config/
+│       │   │   ├── controller/
+│       │   │   ├── dto/
+│       │   │   ├── entity/
+│       │   │   ├── event/
+│       │   │   ├── exception/
+│       │   │   ├── repository/
+│       │   │   └── service/
+│       │   └── resources/
+│       │       ├── db/migration/                 # Flyway schema and seed SQL
+│       │       └── static/                       # Management console
+│       │           ├── index.html
+│       │           ├── styles.css
+│       │           └── app.js
+│       └── test/resources/application.properties
+└── analytics-service/
+    └── src/main/java/in/coderarmy/gatekeeper/analytics/
+        ├── config/
+        ├── controller/
+        └── dto/responseDto/
 ```
 
-Each module has its own `pom.xml`, application entry point and `src/main/resources/application.properties`. Gateway and analytics also have `src/test/java/`. There is no root Maven reactor.
+Each service is a standalone Maven project with its own `pom.xml` and `src/main/resources/application.properties`. There is no root Maven build. The root [Compose file](compose.yaml) starts Redis and Kafka only.
+
+| Service source | Where to look |
+| --- | --- |
+| [Smart Gateway](smart-gateway-service/src/main/java/in/coderarmy/gatekeeper/gateway) | `client/` calls the management API; `event/` receives Kafka notifications; `service/` reloads the route list. |
+| [API Management](api-management-service/src/main/java/in/coderarmy/gatekeeper/management) | `controller/` defines the REST API, `service/` implements tenant and route operations, and `entity/` and `repository/` map those operations to MySQL. |
+| [Analytics](analytics-service/src/main/java/in/coderarmy/gatekeeper/analytics) | `controller/` exposes the health endpoint, `dto/responseDto/` defines its response, and `config/` configures access. |
+
+**Management resources**
+
+- [Database migrations](api-management-service/src/main/resources/db/migration/) — Flyway schema and seed SQL, in execution order.
+- [Web console](api-management-service/src/main/resources/static/) — HTML, CSS and JavaScript served by the management application.
+- [Test configuration](api-management-service/src/test/resources/application.properties) — H2 settings for management tests.
+- [Jenkinsfile](api-management-service/Jenkinsfile) — build, test, package and deployment stages.
 
 ## Microservices
 
@@ -234,6 +271,28 @@ Management emits `GATEWAY_CONFIGURATION_CHANGED` on route changes and selected o
 
 The configured topic uses one partition and one replica. The gateway consumes strings with `auto-offset-reset=earliest`; the payload is a signal to refetch **all** active routes, not a patch. An after-commit send is not an atomic database/Kafka write; asynchronous failures are not handled by the publisher callback. No analytics or request-access topic is implemented.
 
+### From a tenant edit to a gateway refresh
+
+```mermaid
+sequenceDiagram
+    actor Tenant as Tenant administrator
+    participant M as API Management
+    participant DB as MySQL
+    participant K as Kafka
+    participant G as Smart Gateway
+    Tenant->>M: POST /api/tenant/routes (tenant bearer token)
+    M->>DB: Store route, version 1 snapshot and audit record
+    DB-->>M: Commit
+    M->>K: Send configuration change after commit
+    K-->>G: Deliver notification to listener
+    G->>M: GET /api/gateway/routes (gateway bearer token)
+    M->>DB: Select active routes of active organizations
+    M-->>G: Route configuration array
+    G->>G: Print target path prefixes
+```
+
+MySQL is the source of truth; Kafka signals **when** to read it through the management API. To trace a management change, send an optional `X-Correlation-ID` header. `AuditService` copies it into the audit record rather than generating a new ID.
+
 ## Database design
 
 [Flyway migrations](api-management-service/src/main/resources/db/migration) are the schema authority. V1 creates the tables, V2 seeds roles and V3 seeds the platform and gateway accounts. Hibernate validates the migrated schema rather than creating it.
@@ -291,4 +350,6 @@ Describe the use case or bug before proposing a large change. Keep pull requests
 
 ## Author and license
 
-**Karan Kumar** (repository commit attribution) · [Karankumarweb](https://github.com/Karankumarweb). No license file is tracked and the Maven license entries are empty; no project license is declared.
+**Karan Kumar** (repository commit attribution) · [Karankumarweb](https://github.com/Karankumarweb). Design reference: *GateKeeper — Custom API Gateway with Spring Boot*, Lecture 1 architecture notes (Coder Army). The notes describe a target architecture; the implementation sections above describe this checkout.
+
+No license file is tracked and the Maven license entries are empty; no project license is declared.
